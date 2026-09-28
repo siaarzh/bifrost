@@ -110,12 +110,8 @@ export class RoutingRulesPage extends BasePage {
    */
   async goto(): Promise<void> {
     await this.page.goto('/workspace/routing-rules')
-    // Wait for page content (create button, empty state, or table); avoid networkidle (SPA often never idles)
-    await Promise.race([
-      this.createBtn.waitFor({ state: 'visible', timeout: 15000 }),
-      this.emptyState.waitFor({ state: 'visible', timeout: 15000 }),
-      this.table.waitFor({ state: 'visible', timeout: 15000 }),
-    ])
+    // Wait for the rules query to settle (empty state or table); the create button renders before data does.
+    await this.emptyState.or(this.table).first().waitFor({ state: 'visible', timeout: 15000 })
   }
 
   /**
@@ -126,7 +122,7 @@ export class RoutingRulesPage extends BasePage {
   }
 
   private async waitForToastAndAssertSuccess(action: string): Promise<void> {
-    const toast = this.page.locator('[data-sonner-toast]:not([data-removed="true"])').first()
+    const toast = this.page.locator('[data-sonner-toast]:not([data-removed="true"]):not([data-e2e-dismissed])').first()
     await expect(toast).toBeVisible({ timeout: 10000 })
     const toastText = await toast.textContent()
     if (await toast.getAttribute('data-type') === 'error' || toastText?.toLowerCase().includes('error') || toastText?.toLowerCase().includes('failed')) {
@@ -326,8 +322,7 @@ export class RoutingRulesPage extends BasePage {
     await confirmBtn.click()
 
     await this.waitForSuccessToast('deleted')
-    await this.dismissToasts()
-    await waitForNetworkIdle(this.page)
+    await expect(row).toHaveCount(0)
   }
 
   /**
@@ -363,6 +358,13 @@ export class RoutingRulesPage extends BasePage {
    * When there are 0 rules, the view shows an empty state (no table in DOM).
    */
   async getRuleCount(): Promise<number> {
+    // While loading, a skeleton table (same Priority header, 5 placeholder rows) is shown;
+    // the empty state and the search toolbar only render once the list has loaded.
+    await this.emptyState
+      .or(this.page.getByTestId('routing-rules-search-input'))
+      .first()
+      .waitFor({ state: 'visible', timeout: 10000 })
+      .catch(() => {})
     const emptyVisible = await this.emptyState.isVisible().catch(() => false)
     if (emptyVisible) {
       return 0
@@ -394,8 +396,6 @@ export class RoutingRulesPage extends BasePage {
     // Wait for the Add Rule button to be visible (indicates builder is loaded)
     const addRuleBtn = this.sheet.getByRole('button', { name: 'Add Rule', exact: true })
     await addRuleBtn.waitFor({ state: 'visible', timeout: 10000 })
-    // Give time for React to fully render
-    await this.page.waitForTimeout(500)
   }
 
   /**
@@ -405,7 +405,6 @@ export class RoutingRulesPage extends BasePage {
     await this.waitForRuleBuilder()
     const addRuleBtn = this.sheet.getByRole('button', { name: 'Add Rule', exact: true })
     await addRuleBtn.click()
-    await this.page.waitForTimeout(500) // Wait for new rule row to appear
   }
 
   /**
@@ -415,7 +414,6 @@ export class RoutingRulesPage extends BasePage {
     await this.waitForRuleBuilder()
     const addGroupBtn = this.sheet.getByRole('button', { name: 'Add Rule Group', exact: true })
     await addGroupBtn.click()
-    await this.page.waitForTimeout(500) // Wait for new group to appear
   }
 
   /**
@@ -448,9 +446,10 @@ export class RoutingRulesPage extends BasePage {
     const { field: fieldSelector } = await this.getRuleRowComboboxes(ruleIndex)
     await fieldSelector.waitFor({ state: 'visible', timeout: 5000 })
     await fieldSelector.click()
-    await this.page.waitForTimeout(300)
-    await this.page.getByRole('option', { name: new RegExp(`^${fieldName}$`, 'i') }).first().click({ force: true })
-    await this.page.waitForTimeout(300)
+    const option = this.page.getByRole('option', { name: new RegExp(`^${fieldName}$`, 'i') }).first()
+    await option.waitFor()
+    await option.click({ force: true })
+    await expect(this.page.getByRole('listbox')).toHaveCount(0)
   }
 
   /**
@@ -461,11 +460,11 @@ export class RoutingRulesPage extends BasePage {
     const { operator: operatorSelector } = await this.getRuleRowComboboxes(ruleIndex)
     await operatorSelector.waitFor({ state: 'visible', timeout: 5000 })
     await operatorSelector.click()
-    await this.page.waitForTimeout(300)
     // Match operator by exact symbol or text
     const option = this.page.getByRole('option').filter({ hasText: new RegExp(`^${operatorName}$|^${operatorName} `, 'i') }).first()
+    await option.waitFor()
     await option.click({ force: true })
-    await this.page.waitForTimeout(300)
+    await expect(this.page.getByRole('listbox')).toHaveCount(0)
   }
 
   /**
@@ -484,7 +483,6 @@ export class RoutingRulesPage extends BasePage {
     const textInput = ruleRow.locator('input[type="text"]').first()
     if (await textInput.isVisible().catch(() => false)) {
       await textInput.fill(value)
-      await this.page.waitForTimeout(200)
       return
     }
 
@@ -495,7 +493,6 @@ export class RoutingRulesPage extends BasePage {
 
     if (await valueSelector.isVisible().catch(() => false)) {
       await valueSelector.click()
-      await this.page.waitForTimeout(300)
 
       // Type in the search input
       const searchInput = this.page.locator('[cmdk-input]').or(
@@ -504,20 +501,19 @@ export class RoutingRulesPage extends BasePage {
         this.page.locator('[role="listbox"] input')
       )
 
-      if (await searchInput.isVisible().catch(() => false)) {
-        await searchInput.fill(value)
-        await this.page.waitForTimeout(500)
+      if (await searchInput.first().waitFor({ timeout: 2000 }).then(() => true, () => false)) {
+        await searchInput.first().fill(value)
       }
 
       // Try to select matching option
       const option = this.page.getByRole('option', { name: new RegExp(value, 'i') }).first()
-      if (await option.isVisible({ timeout: 2000 }).catch(() => false)) {
+      if (await option.waitFor({ timeout: 5000 }).then(() => true, () => false)) {
         await option.click({ force: true })
       } else {
         // Press escape and type directly in input if no option found
         await this.page.keyboard.press('Escape')
       }
-      await this.page.waitForTimeout(300)
+      await expect(this.page.getByRole('listbox')).toHaveCount(0)
     }
   }
 
@@ -528,7 +524,6 @@ export class RoutingRulesPage extends BasePage {
     // AND/OR are toggle buttons - click the one we want to activate
     const targetBtn = this.sheet.getByRole('button', { name: combinator.toUpperCase(), exact: true })
     await targetBtn.click()
-    await this.page.waitForTimeout(300)
   }
 
   /**
@@ -751,21 +746,14 @@ export class RoutingRulesPage extends BasePage {
    */
   async getRulePriority(name: string): Promise<number | null> {
     const row = this.getRuleRow(name)
+    // Locate the Priority column by its header so column changes don't shift it.
+    const headers = await this.page.locator('table thead th').allTextContents()
+    const index = headers.findIndex((h) => h.trim() === 'Priority')
+    if (index < 0) return null
 
-    // Table columns: Name(0), Provider(1), Model(2), Scope(3), Priority(4), Expression(5), Status(6), Actions(7)
-    const cells = row.locator('td')
-    const count = await cells.count()
-
-    // Priority is in the 5th column (index 4)
-    if (count > 4) {
-      const text = await cells.nth(4).textContent()
-      const num = parseInt(text || '', 10)
-      if (!isNaN(num) && num > 0) {
-        return num
-      }
-    }
-
-    return null
+    const text = await row.locator('td').nth(index).textContent()
+    const num = parseInt(text || '', 10)
+    return !isNaN(num) && num > 0 ? num : null
   }
 
   /**
