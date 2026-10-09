@@ -53,6 +53,8 @@ type sqlDialect interface {
 	// headroom writes max(0, min(max, limit - inFlight)) for integer
 	// expressions written by the callbacks.
 	headroom(b *sqlBuilder, max, limit, inFlight func())
+	// notify tells other instances, once tx commits, that topics have news.
+	notify(tx *gorm.DB, topics []string) error
 }
 
 // laneKey is one key's ordering lane within a consumer group: at most one of
@@ -93,6 +95,7 @@ func (sqliteDialect) headroom(b *sqlBuilder, max, limit, inFlight func()) {
 	b.add("))")
 }
 func (sqliteDialect) lockKeys(*gorm.DB, []laneKey) error { return nil }
+func (sqliteDialect) notify(*gorm.DB, []string) error    { return nil }
 
 // postgresDialect: many instances share the database, so time comes from the
 // database clock and the topic rows, claim candidates and janitor are locked.
@@ -168,6 +171,8 @@ func (postgresDialect) purgeLock(tx *gorm.DB) (bool, error) {
 	err := tx.Raw("SELECT pg_try_advisory_xact_lock(?)", pgJanitorLockKey).Scan(&ok).Error
 	return ok, err
 }
+
+func (postgresDialect) notify(tx *gorm.DB, topics []string) error { return notifyTopics(tx, topics) }
 
 // sqlBuilder accumulates SQL text and its positional arguments together, so a
 // fragment like "now" can carry its own bind values.
@@ -374,7 +379,10 @@ func (s *sqlStore) Append(ctx context.Context, msgs []*Message) error {
 		if err := s.queueBehindLiveHeads(tx, dels); err != nil {
 			return err
 		}
-		return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&dels, sqlChunk).Error
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&dels, sqlChunk).Error; err != nil {
+			return err
+		}
+		return s.dialect.notify(tx, topics)
 	})
 }
 
@@ -868,4 +876,19 @@ func (s *sqlStore) Ping(ctx context.Context) error {
 // Close does nothing: the database handle belongs to the logstore.
 func (s *sqlStore) Close(context.Context) error { return nil }
 
-var _ Store = (*sqlStore)(nil)
+// Listen reports publishes from every instance on Postgres.
+func (s *sqlStore) Listen(ctx context.Context, wake func(topic string)) error {
+	if _, ok := s.dialect.(postgresDialect); !ok {
+		return ErrUnsupported
+	}
+	return listenPostgres(ctx, s.db, wake, func(msg string, args ...any) {
+		if s.logger != nil {
+			s.logger.Warn(msg, args...)
+		}
+	})
+}
+
+var (
+	_ Store      = (*sqlStore)(nil)
+	_ WakeSource = (*sqlStore)(nil)
+)
