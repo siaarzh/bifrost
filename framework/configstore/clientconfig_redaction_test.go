@@ -126,6 +126,44 @@ func TestProviderConfig_Redacted_NestedSecretVars(t *testing.T) {
 // TestProviderConfig_Redacted_AutoMasksEnvBackedFields verifies that env-backed
 // values in provider config fields are redacted in the JSON output of a Redacted()
 // ProviderConfig, including fields like Azure Endpoint.
+func TestProviderConfig_Redacted_OAuthKeyConfig(t *testing.T) {
+	cfg := &ProviderConfig{
+		Keys: []schemas.Key{{
+			ID:   "k1",
+			Name: "oauth",
+			OAuthKeyConfig: &schemas.OAuthKeyConfig{
+				GrantType:    schemas.OAuthGrantClientCredentials,
+				TokenURL:     *schemas.NewSecretVar("https://idp.example/oauth2/token"),
+				ClientID:     schemas.NewSecretVar("client-id-value"),
+				ClientSecret: schemas.NewSecretVar("client-secret-value"),
+				PrivateKey:   schemas.NewSecretVar("-----BEGIN RSA PRIVATE KEY-----"),
+				Scopes:       []string{"inference"},
+				Audience:     "api://acme",
+				ExtraParams:  map[string]string{"resource": "api://acme", "client_assertion": "assertion-secret-value"},
+			},
+		}},
+	}
+
+	redacted := cfg.Redacted()
+	require.Len(t, redacted.Keys, 1)
+	got := redacted.Keys[0].OAuthKeyConfig
+	require.NotNil(t, got)
+	assert.Equal(t, "https://idp.example/oauth2/token", got.TokenURL.GetValue(), "the token URL is an address and stays readable")
+	assert.NotEqual(t, "client-id-value", got.ClientID.GetValue())
+	assert.NotEqual(t, "client-secret-value", got.ClientSecret.GetValue())
+	assert.NotEqual(t, "-----BEGIN RSA PRIVATE KEY-----", got.PrivateKey.GetValue())
+	assert.Equal(t, []string{"inference"}, got.Scopes)
+	assert.Equal(t, "api://acme", got.Audience)
+	// extra_params is a free-form form-parameter map, so a caller may have put a credential in
+	// it; every value is masked on the way out and the keys stay visible.
+	require.Len(t, got.ExtraParams, 2)
+	assert.NotEqual(t, "assertion-secret-value", got.ExtraParams["client_assertion"])
+	assert.NotEqual(t, "api://acme", got.ExtraParams["resource"])
+	// The original is untouched.
+	assert.Equal(t, "client-secret-value", cfg.Keys[0].OAuthKeyConfig.ClientSecret.GetValue())
+	assert.Equal(t, "assertion-secret-value", cfg.Keys[0].OAuthKeyConfig.ExtraParams["client_assertion"])
+}
+
 func TestProviderConfig_Redacted_AutoMasksEnvBackedFields(t *testing.T) {
 	t.Setenv("MY_AZURE_ENDPOINT_SECRET", "https://secret-resource.openai.azure.com")
 

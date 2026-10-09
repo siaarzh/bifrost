@@ -1910,6 +1910,7 @@ func mergeProviderKeys(provider schemas.ModelProvider, fileKeys, dbKeys []schema
 					SGLKeyConfig:           dbKey.SGLKeyConfig,
 					DatabricksKeyConfig:    dbKey.DatabricksKeyConfig,
 					GithubCopilotKeyConfig: dbKey.GithubCopilotKeyConfig,
+					OAuthKeyConfig:         dbKey.OAuthKeyConfig,
 					Enabled:                dbKey.Enabled,
 					UseForBatchAPI:         dbKey.UseForBatchAPI,
 					UseAnthropicEndpoints:  dbKey.UseAnthropicEndpoints,
@@ -1995,6 +1996,7 @@ func reconcileProviderKeys(provider schemas.ModelProvider, fileKeys, dbKeys []sc
 					SGLKeyConfig:           dbKey.SGLKeyConfig,
 					DatabricksKeyConfig:    dbKey.DatabricksKeyConfig,
 					GithubCopilotKeyConfig: dbKey.GithubCopilotKeyConfig,
+					OAuthKeyConfig:         dbKey.OAuthKeyConfig,
 					Enabled:                dbKey.Enabled,
 					UseForBatchAPI:         dbKey.UseForBatchAPI,
 					UseAnthropicEndpoints:  dbKey.UseAnthropicEndpoints,
@@ -6060,22 +6062,22 @@ func ResolveFrameworkPricingConfig(
 	}
 
 	return &configstoreTables.TableFrameworkConfig{
-			ID:                     configID,
-			PricingURL:             resolvedPricingURL,
-			PricingSyncInterval:    resolvedSyncSeconds,
-			ModelParametersURL:     resolvedModelParametersURL,
-			MCPLibraryURL:          resolvedMCPLibraryURL,
-			MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
-			LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
-			ConfigHash:             persistedHash,
-		}, &modelcatalog.Config{
-			PricingURL:             resolvedPricingURL,
-			PricingSyncInterval:    resolvedSyncSeconds,
-			ModelParametersURL:     resolvedModelParametersURL,
-			MCPLibraryURL:          resolvedMCPLibraryURL,
-			MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
-			LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
-		}, needsDBUpdate
+		ID:                     configID,
+		PricingURL:             resolvedPricingURL,
+		PricingSyncInterval:    resolvedSyncSeconds,
+		ModelParametersURL:     resolvedModelParametersURL,
+		MCPLibraryURL:          resolvedMCPLibraryURL,
+		MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
+		LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
+		ConfigHash:             persistedHash,
+	}, &modelcatalog.Config{
+		PricingURL:             resolvedPricingURL,
+		PricingSyncInterval:    resolvedSyncSeconds,
+		ModelParametersURL:     resolvedModelParametersURL,
+		MCPLibraryURL:          resolvedMCPLibraryURL,
+		MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
+		LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
+	}, needsDBUpdate
 }
 
 // initFrameworkConfig initializes framework config and pricing manager from file
@@ -7991,6 +7993,10 @@ func (c *Config) GetAllKeys() ([]configstoreTables.TableKey, error) {
 				cfg.PrivateKey = *cfg.PrivateKey.Redacted()
 				cfg.GithubDomain = *cfg.GithubDomain.Redacted()
 				configStoreKey.GithubCopilotKeyConfig = &cfg
+			}
+			if key.OAuthKeyConfig != nil {
+				// Token URL readable, credentials and every extra_params value masked.
+				configStoreKey.OAuthKeyConfig = key.OAuthKeyConfig.Redacted()
 			}
 			keys = append(keys, configStoreKey)
 		}
