@@ -65,10 +65,9 @@ func ClientCredentialsMinter(cfg ClientCredentialsConfig, hc *http.Client) Minte
 		margin = DefaultRefreshMargin
 	}
 
+	hc = exchangeClient(hc)
 	return func(ctx context.Context, _ *Entry[string]) (*Entry[string], *schemas.BifrostError) {
-		if hc != nil {
-			ctx = context.WithValue(ctx, oauth2.HTTPClient, hc)
-		}
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, hc)
 		token, err := conf.Token(ctx)
 		if err != nil {
 			return nil, tokenRequestError(cfg.TokenURL, err)
