@@ -15,7 +15,7 @@ import { toast } from "sonner";
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { ApiKeyFormFragment } from "../fragments";
-import { stripDatabricksAuthDiscriminator } from "./providerKeyForm.utils";
+import { applyOAuthAuthMethod, stripDatabricksAuthDiscriminator } from "./providerKeyForm.utils";
 interface Props {
 	provider: ModelProvider;
 	keyId: string | null;
@@ -104,15 +104,16 @@ export default function ProviderKeyForm({ provider, keyId, onCancel, onSave }: P
 		if (key.databricks_key_config) {
 			key.databricks_key_config = stripDatabricksAuthDiscriminator(key.databricks_key_config);
 		}
+		const payload = applyOAuthAuthMethod(key, isEditing) as typeof key;
 		const mutation = isEditing
 			? updateProviderKey({
 					provider: provider.name,
 					keyId: currentKey!.id,
-					key,
+					key: payload,
 				})
 			: createProviderKey({
 					provider: provider.name,
-					key,
+					key: payload,
 				});
 
 		mutation
