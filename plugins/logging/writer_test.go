@@ -460,3 +460,202 @@ func TestCleanupInterruptsBlockedFlushAndDrainsIt(t *testing.T) {
 		t.Fatalf("expected 0 dropped requests, got %d", dropped)
 	}
 }
+
+// gatedStore wraps a real store and lets a test toggle the logstore
+// MaintenanceGate, standing in for another node holding the migration lock.
+// It also counts batch inserts so a test can prove nothing reached the store.
+type gatedStore struct {
+	logstore.LogStore
+	migrating atomic.Bool
+	batches   atomic.Int64
+}
+
+func (s *gatedStore) MigrationInProgress(context.Context) bool { return s.migrating.Load() }
+
+func (s *gatedStore) BatchCreateIfNotExists(ctx context.Context, entries []*logstore.Log) error {
+	s.batches.Add(1)
+	return s.LogStore.BatchCreateIfNotExists(ctx, entries)
+}
+
+// shrinkMaintenanceTimers makes the pause loop fast enough for a unit test and
+// restores the production values afterwards.
+func shrinkMaintenanceTimers(t *testing.T, poll, maxPause time.Duration) {
+	t.Helper()
+	prevPoll, prevMax := maintenancePollInterval, maintenanceMaxPause
+	maintenancePollInterval, maintenanceMaxPause = poll, maxPause
+	t.Cleanup(func() { maintenancePollInterval, maintenanceMaxPause = prevPoll, prevMax })
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func countLogs(t *testing.T, store logstore.LogStore) int64 {
+	t.Helper()
+	res, err := store.SearchLogs(context.Background(), logstore.SearchFilters{}, logstore.PaginationOptions{Limit: 100})
+	if err != nil {
+		t.Fatalf("SearchLogs() error = %v", err)
+	}
+	return res.Pagination.TotalCount
+}
+
+// TestBatchWriterPausesWhileMigrationLockHeld pins the gate: while another node
+// holds the logstore migration lock the batch writer issues no inserts, the
+// write queue is the only buffer (overflow drops as always, now also counted
+// under droppedDuringMaintenance), and everything buffered lands once the lock
+// is released.
+func TestBatchWriterPausesWhileMigrationLockHeld(t *testing.T) {
+	shrinkMaintenanceTimers(t, 10*time.Millisecond, time.Minute)
+	inner := newTestStore(t)
+	store := &gatedStore{LogStore: inner}
+	store.migrating.Store(true)
+	const batch, capacity, overflow = 2, 3, 2
+	plugin, err := Init(context.Background(), &Config{Writer: &logstore.WriterConfig{
+		MaxBatchSize:       batch,
+		BatchInterval:      "10ms",
+		WriteQueueCapacity: capacity,
+	}}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	for i := 0; i < batch; i++ {
+		plugin.enqueueLogEntry(makeTestLog(fmt.Sprintf("paused-batch-%d", i)), nil)
+	}
+	waitFor(t, "writer to pause on the held lock", plugin.writerPaused.Load)
+
+	// The writer is not consuming: these fill the channel, then two more overflow.
+	for i := 0; i < capacity+overflow; i++ {
+		plugin.enqueueLogEntry(makeTestLog(fmt.Sprintf("paused-queued-%d", i)), nil)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := store.batches.Load(); got != 0 {
+		t.Fatalf("expected no inserts while the migration lock is held, got %d batch calls", got)
+	}
+	if got := plugin.droppedRequests.Load(); got != overflow {
+		t.Fatalf("expected %d queue-full drops, got %d", overflow, got)
+	}
+	if got := plugin.droppedDuringMaintenance.Load(); got != overflow {
+		t.Fatalf("expected the %d drops to be attributed to the migration window, got %d", overflow, got)
+	}
+
+	store.migrating.Store(false)
+	waitFor(t, "buffered entries to be written after the lock cleared", func() bool {
+		return countLogs(t, inner) == batch+capacity
+	})
+	waitFor(t, "writer to clear its paused flag", func() bool { return !plugin.writerPaused.Load() })
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	if got := plugin.droppedRequests.Load(); got != overflow {
+		t.Fatalf("resume must not drop anything further: expected %d, got %d", overflow, got)
+	}
+}
+
+// TestBatchWriterForcedFlushAfterMaxPause pins the safety valve: a lock that is
+// never released cannot stall writes forever; after maintenanceMaxPause the
+// writer flushes exactly as it did before the gate existed.
+func TestBatchWriterForcedFlushAfterMaxPause(t *testing.T) {
+	shrinkMaintenanceTimers(t, 10*time.Millisecond, 40*time.Millisecond)
+	inner := newTestStore(t)
+	store := &gatedStore{LogStore: inner}
+	store.migrating.Store(true)
+	const N = 2
+	plugin, err := Init(context.Background(), &Config{Writer: &logstore.WriterConfig{
+		MaxBatchSize:  N,
+		BatchInterval: "10ms",
+	}}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() { _ = plugin.Cleanup() })
+
+	for i := 0; i < N; i++ {
+		plugin.enqueueLogEntry(makeTestLog(fmt.Sprintf("forced-%d", i)), nil)
+	}
+	waitFor(t, "forced flush after the pause cap", func() bool { return countLogs(t, inner) == N })
+	if plugin.droppedRequests.Load() != 0 {
+		t.Fatalf("forced flush must not drop entries, got %d", plugin.droppedRequests.Load())
+	}
+}
+
+// TestCleanupDuringMigrationPauseStillDrains pins shutdown behaviour: Cleanup
+// interrupts a paused writer at once and its drain writes both the held batch
+// and the queue without consulting the gate.
+func TestCleanupDuringMigrationPauseStillDrains(t *testing.T) {
+	shrinkMaintenanceTimers(t, 10*time.Millisecond, time.Minute)
+	inner := newTestStore(t)
+	store := &gatedStore{LogStore: inner}
+	store.migrating.Store(true)
+	const batch, queued = 2, 3
+	plugin, err := Init(context.Background(), &Config{Writer: &logstore.WriterConfig{
+		MaxBatchSize:       batch,
+		BatchInterval:      "10ms",
+		WriteQueueCapacity: queued,
+	}}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	for i := 0; i < batch; i++ {
+		plugin.enqueueLogEntry(makeTestLog(fmt.Sprintf("drain-batch-%d", i)), nil)
+	}
+	waitFor(t, "writer to pause on the held lock", plugin.writerPaused.Load)
+	for i := 0; i < queued; i++ {
+		plugin.enqueueLogEntry(makeTestLog(fmt.Sprintf("drain-queued-%d", i)), nil)
+	}
+
+	start := time.Now()
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("Cleanup took %s; a paused writer must hand off immediately", took)
+	}
+	if got := countLogs(t, inner); got != batch+queued {
+		t.Fatalf("expected the drain to persist all %d entries despite the held lock, got %d", batch+queued, got)
+	}
+	if plugin.droppedRequests.Load() != 0 {
+		t.Fatalf("expected 0 dropped requests, got %d", plugin.droppedRequests.Load())
+	}
+}
+
+// TestBatchWriterGateFalseWritesAsUsual pins the non-regression invariant: a
+// store whose gate reports no migration behaves exactly like a store without
+// a gate at all.
+func TestBatchWriterGateFalseWritesAsUsual(t *testing.T) {
+	const N = 5
+	for name, mk := range map[string]func(inner logstore.LogStore) logstore.LogStore{
+		"no gate":    func(inner logstore.LogStore) logstore.LogStore { return &recordingStore{LogStore: inner} },
+		"gate false": func(inner logstore.LogStore) logstore.LogStore { return &gatedStore{LogStore: inner} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			inner := newTestStore(t)
+			plugin, err := Init(context.Background(), &Config{Writer: &logstore.WriterConfig{
+				MaxBatchSize:  N,
+				BatchInterval: "10ms",
+			}}, testLogger{}, mk(inner), nil, nil, nil)
+			if err != nil {
+				t.Fatalf("Init() error = %v", err)
+			}
+			for i := 0; i < N; i++ {
+				plugin.enqueueLogEntry(makeTestLog(fmt.Sprintf("plain-%d", i)), nil)
+			}
+			waitFor(t, "all entries to be written", func() bool { return countLogs(t, inner) == N })
+			if err := plugin.Cleanup(); err != nil {
+				t.Fatalf("Cleanup() error = %v", err)
+			}
+			if plugin.writerPaused.Load() || plugin.droppedDuringMaintenance.Load() != 0 || plugin.droppedRequests.Load() != 0 {
+				t.Fatalf("no pause or drops expected: paused=%v maintenanceDrops=%d drops=%d",
+					plugin.writerPaused.Load(), plugin.droppedDuringMaintenance.Load(), plugin.droppedRequests.Load())
+			}
+		})
+	}
+}

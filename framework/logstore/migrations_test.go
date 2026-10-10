@@ -902,3 +902,91 @@ func TestMigrationAddEmbeddingInputColumn_SQLite(t *testing.T) {
 	require.NoError(t, err)
 	runEmbeddingInputColumnCases(t, db)
 }
+
+// TestAdvisoryKeyHalves pins how a bigint advisory key maps onto the
+// (classid, objid) pair pg_locks reports, which the migration probe queries by.
+func TestAdvisoryKeyHalves(t *testing.T) {
+	classid, objid := advisoryKeyHalves(migrationAdvisoryLockKey)
+	assert.Equal(t, int64(0), classid)
+	assert.Equal(t, int64(migrationAdvisoryLockKey), objid)
+
+	classid, objid = advisoryKeyHalves(int64(7)<<32 | 42)
+	assert.Equal(t, int64(7), classid)
+	assert.Equal(t, int64(42), objid)
+}
+
+// TestMigrationLockProbeNonPostgresNeverReportsMigration pins the fail-open
+// defaults: no store, no database, or a non-Postgres dialect all read as
+// "not migrating" without issuing any query.
+func TestMigrationLockProbeNonPostgresNeverReportsMigration(t *testing.T) {
+	var nilProbe *migrationLockProbe
+	assert.False(t, nilProbe.inProgress(context.Background()))
+	assert.False(t, newMigrationLockProbe(nil, testLogger{}).inProgress(context.Background()))
+
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "probe.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	store := &RDBLogStore{db: db, logger: testLogger{}}
+	assert.False(t, store.MigrationInProgress(context.Background()))
+	assert.False(t, MigrationInProgressFor(context.Background(), store))
+	assert.False(t, MigrationInProgressFor(context.Background(), struct{}{}), "a value without the gate reads as not migrating")
+}
+
+// TestMigrationLockProbeCachesWithinTTL pins that one answer is reused for
+// maintenanceCheckTTL so many pollers cost the database one query per TTL.
+func TestMigrationLockProbeCachesWithinTTL(t *testing.T) {
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	probe := &migrationLockProbe{now: func() time.Time { return now }, checkedAt: now, held: true}
+	assert.True(t, probe.inProgress(context.Background()), "a fresh cached answer is served without a database")
+
+	now = now.Add(maintenanceCheckTTL)
+	assert.False(t, probe.inProgress(context.Background()), "an expired cache falls through to the (absent) database and fails open")
+}
+
+// TestMigrationInProgressTracksAdvisoryLockPostgres pins the live probe: it
+// sees the migration lock held by another session, ignores other keys, clears
+// when the holder goes away, and fails open when the database is unreachable.
+func TestMigrationInProgressTracksAdvisoryLockPostgres(t *testing.T) {
+	db := trySetupPostgresDB(t)
+	if db == nil {
+		t.Skip("Postgres not available, skipping test")
+	}
+	store := &RDBLogStore{db: db, logger: testLogger{}}
+	fresh := func() bool {
+		probe := store.migrationProbe()
+		probe.mu.Lock()
+		probe.checkedAt = time.Time{}
+		probe.mu.Unlock()
+		return store.MigrationInProgress(context.Background())
+	}
+
+	require.False(t, fresh(), "no lock held yet")
+
+	holderDB, holder := acquireTestAdvisoryLockOnIsolatedPool(t, migrationAdvisoryLockKey)
+	require.True(t, fresh(), "migration lock held by another session must be visible")
+	assert.True(t, store.MigrationInProgress(context.Background()), "cached answer within the TTL")
+	closeTestAdvisoryLockSession(t, holderDB, holder)
+	require.Eventually(t, probeReports(store, false), 5*time.Second, 50*time.Millisecond, "lock must clear once the holder's session ends")
+
+	indexDB, indexHolder := acquireTestAdvisoryLockOnIsolatedPool(t, indexAdvisoryLockKey)
+	require.False(t, fresh(), "a different advisory key (background index build) must not read as a migration")
+	closeTestAdvisoryLockSession(t, indexDB, indexHolder)
+
+	closedDB := trySetupPostgresDB(t)
+	require.NotNil(t, closedDB)
+	closedSQL, err := closedDB.DB()
+	require.NoError(t, err)
+	require.NoError(t, closedSQL.Close())
+	assert.False(t, newMigrationLockProbe(closedDB, testLogger{}).inProgress(context.Background()), "an unreachable database fails open")
+}
+
+// probeReports returns a poll function that resets the probe cache and reports
+// whether MigrationInProgress equals want.
+func probeReports(store *RDBLogStore, want bool) func() bool {
+	return func() bool {
+		probe := store.migrationProbe()
+		probe.mu.Lock()
+		probe.checkedAt = time.Time{}
+		probe.mu.Unlock()
+		return store.MigrationInProgress(context.Background()) == want
+	}
+}
