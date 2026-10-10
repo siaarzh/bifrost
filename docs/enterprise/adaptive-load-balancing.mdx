@@ -245,6 +245,29 @@ When the provider named a wait shorter than 10 seconds, the first line says so: 
 
 ---
 
+## Incidents
+
+The **Incidents** page lists every problem adaptive routing saw on a provider, model or key in the selected window, merged across nodes. Open it from **Adaptive Routing → Incidents** in the sidebar (`/workspace/adaptive-routing/incidents`). It needs View on the `AdaptiveRouter` resource, the same as the dashboard.
+
+At the top, four figures cover the incidents that match your filters:
+
+| Figure | Meaning |
+|--------|---------|
+| Incidents | How many incidents match, out of the window's total when a filter is on |
+| Needs attention | Incidents waiting on an operator. Click it to filter the list to them. The footer counts requests that named a failing provider and kept failing |
+| Median time to resolve | Median duration of the resolved incidents |
+| Longest ongoing | Duration of the longest incident still open. Click it to list the open ones, longest first |
+
+The table shows when each incident opened (**Opened**), how long it lasted (**Duration**), its **Status**, **Where** it happened and its **Cause**. Click a row to open the incident's details, then step through the list with Previous and Next.
+
+Status is one of Needs attention, Recovering, Mitigated, Waiting for traffic, Resolved or No longer observed. Waiting for traffic means nothing has reached the route since it recovered, so recovery is unconfirmed. No longer observed means the history lost sight of the incident before it closed.
+
+The sidebar filters by Status, Providers, Models, Reason, Worst state, Scope, Regions and Nodes, and each value shows how many incidents it keeps. Scope is the level the incident sits at: a key on a model, a provider and model, or a key across every model. The search box matches provider, model or key. Sort by needs attention first, newest, oldest, longest or shortest.
+
+The page shares the dashboard's time window, Live mode and filters through the URL, so you can move between the two without losing them.
+
+The same list is available over the API, described next.
+
 ## Listing incidents through the API
 
 `GET /api/adaptive-routing/history/issues` returns the issues a time window touched. Without `limit` or `offset` it returns every issue, which is what the dashboard reads. With either one it returns a filtered, sorted page of issues, which is what the incidents page reads.
