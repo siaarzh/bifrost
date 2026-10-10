@@ -37,6 +37,26 @@ For each MCP client associated with a Virtual Key, you can specify the allowed t
 Inactive or [expired](./virtual-keys#key-expiry) Virtual Keys are rejected at MCP tool execution time with a `403`, regardless of their tool configuration.
 </Note>
 
+### Disabled MCP clients
+
+A Virtual Key's allow-list does not switch an MCP client on. If the client is disabled, Bifrost keeps no connection to it and its tools are not offered, even when the key lists them or uses `*`. The key's configuration stays in place, so the tools return once the client is enabled again.
+
+Each entry in a Virtual Key's `mcp_configs` carries the client's current `disabled` value on its nested `mcp_client` object, so you can tell from the key alone why a tool is missing:
+
+```json
+{
+  "mcp_configs": [
+    {
+      "mcp_client_id": 3,
+      "tools_to_execute": ["*"],
+      "mcp_client": { "name": "billing-client", "disabled": true }
+    }
+  ]
+}
+```
+
+The flag belongs to the client, not the key. Change it on the MCP client (the **Disabled** switch in its settings, or `disabled` on `PUT /api/mcp/client/{id}`), not through the Virtual Key.
+
 ## Setting MCP Tool Restrictions
 
 <Tabs group="mcp-tool-restrictions">
