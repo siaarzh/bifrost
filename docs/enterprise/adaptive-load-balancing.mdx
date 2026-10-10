@@ -245,6 +245,38 @@ When the provider named a wait shorter than 10 seconds, the first line says so: 
 
 ---
 
+## Listing incidents through the API
+
+`GET /api/adaptive-routing/history/issues` returns the issues a time window touched. Without `limit` or `offset` it returns every issue, which is what the dashboard reads. With either one it returns a filtered, sorted page of issues, which is what the incidents page reads.
+
+| Parameter | Description |
+| --- | --- |
+| `from`, `to` | Window bounds as RFC 3339 or unix seconds. |
+| `nodes`, `entities` | Comma-separated node IDs, and entity keys as `route:provider:model:key_id`, `direction:provider:model` or `key:provider:key_id`. |
+| `limit` | Page size. Default `25`, maximum `100`. A larger value falls back to `25`. |
+| `offset` | Issues to skip. A negative value returns `400`. An offset past the end returns the last page, and the response gives the offset it used. |
+| `ids`, `statuses`, `states`, `scopes`, `reasons`, `providers`, `models` | Comma-separated filters. |
+| `search` | Matches the issue ID, provider, models, key IDs and key display names. |
+| `sort` | `priority` (default), `newest`, `oldest`, `longest` or `shortest`. `priority` puts issues that need attention first, then newest. Any other value returns `400`. |
+
+`statuses` takes `attention`, `recovering`, `mitigated`, `resolved`, `unobserved` or `waiting`. An `unobserved` issue is resolved, but history stopped seeing its nodes. A `waiting` issue was recovering when requests stopped reaching it. Neither counts toward the median time to resolve, because neither is known to have recovered.
+
+A paged response carries these fields next to the page:
+
+| Field | Contents |
+| --- | --- |
+| `total`, `offset` | Size of the matched set and the offset used. |
+| `matched_summary` | Attention, ongoing and resolved counts, median resolve time, longest ongoing duration and the pinned-kept-failed total. Computed over every matched issue, not only the page. |
+| `facets` | How many issues each filter value keeps across the whole window. Model facets narrow to the selected providers. |
+| `key_names` | Key IDs mapped to display names, for the issues on the current page. |
+
+```bash
+curl "https://your-bifrost-gateway/api/adaptive-routing/history/issues?statuses=attention,recovering&sort=longest&limit=25&offset=0" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+---
+
 ## Configuration
 
 Adaptive load balancing ships **pre-tuned** - the scoring weights, thresholds, recovery timings, and the waits for [held keys](#held-keys) are not user-configurable by design. The operator controls are five switches, plus [releasing held keys](#releasing-held-keys):
